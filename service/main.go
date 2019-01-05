@@ -10,17 +10,26 @@ import (
 	"reflect"
 	"strconv"
 
+	"cloud.google.com/go/bigtable"
 	"cloud.google.com/go/storage"
 	"github.com/olivere/elastic"
 	"github.com/pborman/uuid"
+	// "google.golang.org/api/option"
 )
 
+// Set the credential environmental variable:
+// export GOOGLE_APPLICATION_CREDENTIALS=/Users/k2i/Documents/Around-388bd12736ed.json
+
 const (
-	POST_INDEX  = "post"
-	POST_TYPE   = "post"
-	DISTANCE    = "200km"
-	ES_URL      = "http://35.193.124.56:9200"
-	BUCKET_NAME = "post-images-around-632876"
+	POST_INDEX      = "post"
+	POST_TYPE       = "post"
+	DISTANCE        = "200km"
+	ES_URL          = "http://35.193.124.56:9200"
+	BUCKET_NAME     = "post-images-around-632876"
+	ENABLE_BIGTABLE = true
+	PROJECT_ID      = "alpine-charge-225722"
+	BT_INSTANCE     = "around-post"
+	// CREDENTIAL      = "Around-388bd12736ed.json"
 )
 
 type Location struct {
@@ -86,6 +95,32 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Printf("Saved one post to ElasticSearch: %s", p.Message)
+
+	if ENABLE_BIGTABLE {
+		saveToBT(p, id)
+	}
+}
+
+func saveToBT(p *Post, id string) {
+	ctx := context.Background()
+	btClient, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE) //, option.WithCredentialsFile(CREDENTIAL))
+	if err != nil {
+		panic(err)
+	}
+	tbl := btClient.Open("post")
+	mut := bigtable.NewMutation()
+	t := bigtable.Now()
+	mut.Set("post", "user", t, []byte(p.User))
+	mut.Set("post", "message", t, []byte(p.Message))
+	mut.Set("location", "lat", t, []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
+	mut.Set("location", "lon", t, []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
+
+	err = tbl.Apply(ctx, id, mut)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
+	return
 }
 
 func handlerSearch(w http.ResponseWriter, r *http.Request) {
