@@ -1,36 +1,19 @@
 package main
 
 import (
-	"context"
+	"Around/utils"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"reflect"
 	"strconv"
 
-	"cloud.google.com/go/bigtable"
-	"cloud.google.com/go/storage"
-	"github.com/olivere/elastic"
 	"github.com/pborman/uuid"
 	// "google.golang.org/api/option"
 )
 
 // Set the credential environmental variable:
 // export GOOGLE_APPLICATION_CREDENTIALS=/Users/k2i/Documents/Around-388bd12736ed.json
-
-const (
-	POST_INDEX      = "post"
-	POST_TYPE       = "post"
-	DISTANCE        = "200km"
-	ES_URL          = "http://35.193.124.56:9200"
-	BUCKET_NAME     = "post-images-around-632876"
-	ENABLE_BIGTABLE = false
-	PROJECT_ID      = "alpine-charge-225722"
-	BT_INSTANCE     = "around-post"
-	// CREDENTIAL      = "Around-388bd12736ed.json"
-)
 
 type Location struct {
 	Lat float64 `json:"lat"`
@@ -46,6 +29,7 @@ type Post struct {
 }
 
 func main() {
+	utils.ParseArgs()
 	fmt.Println("started-service")
 	createIndexIfNotExist()
 	http.HandleFunc("/post", handlerPost)
@@ -80,7 +64,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Image is not available %v.\n", err)
 		return
 	}
-	attrs, err := saveToGCS(file, BUCKET_NAME, id)
+	attrs, err := saveToGCS(file, utils.BUCKET_NAME, id)
 	if err != nil {
 		http.Error(w, "Failed to save image to GCS", http.StatusInternalServerError)
 		fmt.Printf("Failed to save image to GCS \"%v\".\n", err)
@@ -96,31 +80,9 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Printf("Saved one post to ElasticSearch: %s", p.Message)
 
-	if ENABLE_BIGTABLE {
+	if utils.ENABLE_BIGTABLE {
 		saveToBT(p, id)
 	}
-}
-
-func saveToBT(p *Post, id string) {
-	ctx := context.Background()
-	btClient, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE) //, option.WithCredentialsFile(CREDENTIAL))
-	if err != nil {
-		panic(err)
-	}
-	tbl := btClient.Open("post")
-	mut := bigtable.NewMutation()
-	t := bigtable.Now()
-	mut.Set("post", "user", t, []byte(p.User))
-	mut.Set("post", "message", t, []byte(p.Message))
-	mut.Set("location", "lat", t, []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
-	mut.Set("location", "lon", t, []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
-
-	err = tbl.Apply(ctx, id, mut)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
-	return
 }
 
 func handlerSearch(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +95,7 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	lat, _ := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
 	lon, _ := strconv.ParseFloat(r.URL.Query().Get("lon"), 64)
 	// range is optional
-	ran := DISTANCE
+	ran := utils.DISTANCE
 	if val := r.URL.Query().Get("range"); val != "" {
 		ran = val + "km"
 	}
@@ -153,124 +115,4 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Write(js)
-}
-
-func createIndexIfNotExist() {
-	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
-	if err != nil {
-		panic(err)
-	}
-
-	exists, err := client.IndexExists(POST_INDEX).Do(context.Background())
-	if err != nil {
-		panic(err)
-	}
-
-	if !exists {
-		mapping := `{
-			"mappings": {
-				"post": {
-					"properties": {
-						"location": {
-							"type": "geo_point"
-						}
-					}
-				}
-			}
-		}`
-		_, err = client.CreateIndex(POST_INDEX).Body(mapping).Do(context.Background())
-		if err != nil {
-			panic(err)
-		}
-	}
-
-}
-
-// Save a post to ElasticSearch
-func saveToES(post *Post, id string) error {
-	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
-	if err != nil {
-		return err
-	}
-
-	_, err = client.Index().
-		Index(POST_INDEX).
-		Type(POST_TYPE).
-		Id(id).
-		BodyJson(post).
-		Refresh("wait_for").
-		Do(context.Background())
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Post is saved to index: \"%s\"\n", post.Message)
-	return nil
-}
-
-func readFromES(lat, lon float64, ran string) ([]Post, error) {
-	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
-	if err != nil {
-		return nil, err
-	}
-
-	query := elastic.NewGeoDistanceQuery("location")
-	query = query.Distance(ran).Lat(lat).Lon(lon)
-
-	searchResult, err := client.Search().
-		Index(POST_INDEX).
-		Query(query).
-		Pretty(true).
-		Do(context.Background())
-	if err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("Query took %d ms\n", searchResult.TookInMillis)
-
-	var ptyp Post
-	var posts []Post
-	for _, item := range searchResult.Each(reflect.TypeOf(ptyp)) {
-		if p, ok := item.(Post); ok {
-			posts = append(posts, p)
-		}
-	}
-
-	return posts, nil
-}
-
-func saveToGCS(r io.Reader, bucketName, objectName string) (*storage.ObjectAttrs, error) {
-	ctx := context.Background()
-
-	// Creates a client.
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	bucket := client.Bucket(bucketName)
-	if _, err := bucket.Attrs(ctx); err != nil {
-		return nil, err
-	}
-
-	object := bucket.Object(objectName)
-	wc := object.NewWriter(ctx)
-	if _, err = io.Copy(wc, r); err != nil {
-		return nil, err
-	}
-	if err := wc.Close(); err != nil {
-		return nil, err
-	}
-
-	if err = object.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
-		return nil, err
-	}
-
-	attrs, err := object.Attrs(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("Image is saved to GCS: \"%s\"\n", attrs.MediaLink)
-	return attrs, nil
 }
